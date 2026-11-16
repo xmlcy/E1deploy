@@ -233,6 +233,17 @@ class HybridAmpInference:
         self.command_vel[2] = raw_yaw * self.max_yaw_vel
         self._refresh_gait_parameters()
 
+    def set_velocity_command(self, vel_x: float, vel_y: float, vel_yaw: float) -> None:
+        """Set a physical-unit command received from the public API."""
+        self.command_vel[0] = np.clip(
+            vel_x, -self.max_backward_vel, self.max_forward_vel
+        )
+        self.command_vel[1] = np.clip(
+            vel_y, -self.max_lateral_vel, self.max_lateral_vel
+        )
+        self.command_vel[2] = np.clip(vel_yaw, -self.max_yaw_vel, self.max_yaw_vel)
+        self._refresh_gait_parameters()
+
     def _current_observation(self, robot) -> np.ndarray:
         q_real = np.asarray(
             list(robot.legState.position[:13]) + list(robot.armState.position[:8]),
@@ -285,8 +296,7 @@ class HybridAmpInference:
         initial_frame = self._current_observation(robot)
         self.obs_history = np.tile(initial_frame, self.history_length).astype(np.float32)
 
-    def step(self, robot, raw_command: tuple[float, float, float]) -> np.ndarray:
-        self.set_gamepad_command(*raw_command)
+    def _infer(self, robot) -> np.ndarray:
         action = self.session.run(
             [self.output_name], {self.input_name: self._push_observation(robot)}
         )[0].reshape(-1)
@@ -297,3 +307,14 @@ class HybridAmpInference:
         target = target_onnx[self.idx_to_real]
         self._update_phase()
         return target.astype(np.float32)
+
+    def step(self, robot, raw_command: tuple[float, float, float]) -> np.ndarray:
+        self.set_gamepad_command(*raw_command)
+        return self._infer(robot)
+
+    def step_velocity(
+        self, robot, velocity_command: tuple[float, float, float]
+    ) -> np.ndarray:
+        """Run one policy step from an API command in m/s and rad/s."""
+        self.set_velocity_command(*velocity_command)
+        return self._infer(robot)

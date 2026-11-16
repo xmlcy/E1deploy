@@ -8,10 +8,13 @@ only a stationary Hybrid state may enter either Mimic policy.
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import math
 import sys
 import time
 from enum import Enum, auto
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +26,13 @@ if str(CURRENT_DIR) not in sys.path:
 
 # Import from this directory deliberately. Importing ``fsm.*`` here would load
 # the obsolete IsaacLab deployment under ``sim2real/fsm`` instead.
-from gamepad_controller import GamepadController  # noqa: E402
 from hybrid_amp_inference import (  # noqa: E402
     REAL_JOINT_NAMES,
     HybridAmpInference,
 )
 from mimic_inference import MimicInference  # noqa: E402
+from rl_api import RobotCommand, RobotStatus, RlWebSocketServer  # noqa: E402
+from rl_api.protocol import finite_or_zero  # noqa: E402
 
 
 class ControlState(Enum):
@@ -40,7 +44,6 @@ class ControlState(Enum):
     HYBRID = auto()
     MIMIC = auto()
     DAMPING = auto()
-    RECOVERY_HOLD = auto()
 
 
 class UnifiedE1Fsm:
@@ -52,10 +55,20 @@ class UnifiedE1Fsm:
     fall_hard_tilt_threshold_deg = 75.0
     fall_detection_frames = 3
     recovery_upright_tilt_deg = 30.0
-    recovery_gain_ramp_duration = 0.75
-    recovery_kp_fraction = 0.35
     leg_damping = 4.0
     arm_damping = 2.0
+
+    @property
+    def state(self) -> ControlState:
+        return self._state
+
+    @state.setter
+    def state(self, value: ControlState) -> None:
+        previous = getattr(self, "_state", None)
+        self._state = value
+        if previous != value:
+            previous_name = previous.name if previous is not None else "UNINITIALIZED"
+            self.logger.info("STATE %s -> %s", previous_name, value.name)
 
     def __init__(
         self,
@@ -66,7 +79,14 @@ class UnifiedE1Fsm:
         mimic2_motion_frames: int | None,
         mimic1_start_frame: int,
         mimic2_start_frame: int,
+        *,
+        api_host: str = "0.0.0.0",
+        api_port: int = 8765,
+        api_auth_token: str = "droidpad",
+        api_status_hz: float = 20.0,
+        api_enabled: bool = True,
     ) -> None:
+        self.logger = logging.getLogger("e1_fsm")
         # Load and validate all models before opening the robot connection.
         # Only the active model is evaluated inside the 50-Hz loop.
         self.hybrid = HybridAmpInference(hybrid_policy)
@@ -97,6 +117,7 @@ class UnifiedE1Fsm:
         # Keep policy validation usable on a development machine without the
         # real-robot SDK.  Hardware modules are imported only when this runner
         # is actually constructed.
+        from gamepad_controller import GamepadController
         from base.Base import NanoSleep
         from base.RobotBase import RobotBase
         from base.configs import E1_21dof as RobotConfig
@@ -126,9 +147,23 @@ class UnifiedE1Fsm:
         self.transition_kp = self.hybrid.kp_real.copy()
         self.transition_kd = self.hybrid.kd_real.copy()
         self.transition_elapsed = 0.0
-        self.recovery_target = np.zeros(21, dtype=np.float32)
-        self.recovery_elapsed = 0.0
         self.fall_counter = 0
+        self.fall_latched = False
+        self.recovery_default_active = False
+        self.pending_api_dance: str | None = None
+        self.hybrid_control_source = "gamepad"
+        self.last_status_log_time = 0.0
+        self.last_gamepad_log: tuple[object, ...] | None = None
+        self.api_server = (
+            RlWebSocketServer(
+                api_host,
+                api_port,
+                auth_token=api_auth_token,
+                status_hz=api_status_hz,
+            )
+            if api_enabled
+            else None
+        )
 
     def _joint_positions(self) -> np.ndarray:
         return np.asarray(
@@ -198,6 +233,13 @@ class UnifiedE1Fsm:
             return float("inf")
         return math.degrees(math.acos(float(np.clip(-gravity[2] / norm, -1.0, 1.0))))
 
+    def _hybrid_entry_ready(self) -> tuple[bool, float]:
+        tilt = self._torso_tilt_deg()
+        return (
+            math.isfinite(tilt) and tilt <= self.recovery_upright_tilt_deg,
+            tilt,
+        )
+
     def _begin_transition(
         self,
         destination: ControlState,
@@ -233,16 +275,27 @@ class UnifiedE1Fsm:
             mimic.kd_real,
         )
 
-    def _enter_damping(self, reason: str) -> None:
+    def _enter_damping(self, reason: str, *, fall: bool = False) -> None:
         self.state = ControlState.DAMPING
         self.control_claimed = True
         self.fall_counter = 0
+        self.fall_latched = fall
+        self.recovery_default_active = False
         self.hybrid.command_vel.fill(0.0)
         self._send_damping()
+        self.logger.warning("DAMPING reason=%s fall=%s", reason, fall)
         print(f"\n[SAFETY] {reason}: entered DAMPING")
-        print("[SAFETY] X: stiffen in-place for assisted lifting; B: exit")
+        print("[SAFETY] X: move to default pose for assisted lifting; B: exit")
 
     def _check_fall(self) -> None:
+        if self.recovery_default_active and self.state in (
+            ControlState.GO_TO_DEFAULT,
+            ControlState.STANDBY,
+        ):
+            # Keep commanding the known default joint pose while an operator
+            # lifts the robot. Re-entering Hybrid remains angle-gated by A.
+            self.fall_counter = 0
+            return
         monitored = {
             ControlState.GO_TO_DEFAULT,
             ControlState.STANDBY,
@@ -263,7 +316,7 @@ class UnifiedE1Fsm:
             self.fall_counter = 0
         if self.fall_counter >= self.fall_detection_frames:
             text = f"fall detected ({tilt:.1f} deg)" if math.isfinite(tilt) else "invalid IMU"
-            self._enter_damping(text)
+            self._enter_damping(text, fall=True)
 
     def _run_transition(self) -> None:
         progress = min(self.transition_elapsed / self.interpolation_duration, 1.0)
@@ -282,7 +335,13 @@ class UnifiedE1Fsm:
         self.target_q = self.transition_target.copy()
         if self.state == ControlState.GO_TO_DEFAULT:
             self.state = ControlState.STANDBY
-            print("[SUCCESS] Default pose reached: press A for Hybrid")
+            if self.recovery_default_active:
+                print(
+                    "[SAFETY] Recovery default pose reached: lift robot upright, "
+                    "then press A"
+                )
+            else:
+                print("[SUCCESS] Default pose reached: press A for Hybrid")
         elif self.state == ControlState.GO_TO_MIMIC_START:
             if self.active_mimic is None or self.active_mimic_name is None:
                 raise RuntimeError("Mimic transition completed without a selected policy")
@@ -294,39 +353,115 @@ class UnifiedE1Fsm:
             )
         elif self.state == ControlState.GO_TO_HYBRID_START:
             self.hybrid.reset(self.robot)
+            self.hybrid_control_source = "gamepad"
             self.state = ControlState.HYBRID
             print("[SUCCESS] Hybrid default pose reached: walk-run inference started")
 
-    def _start_recovery_hold(self) -> None:
-        self.recovery_target = self._joint_positions()
-        self.recovery_elapsed = 0.0
-        self.state = ControlState.RECOVERY_HOLD
-        print("[SAFETY] RECOVERY_HOLD: ramping stiffness at the current pose")
-        print("[SAFETY] Lift/support upright, then press X again for default pose")
+    def _api_loco_mode(self) -> str:
+        if self.fall_latched:
+            return "loco_fall"
+        if self.state == ControlState.DAMPING:
+            return "loco_stop"
+        if self.state == ControlState.IDLE:
+            return "none"
+        return "loco_walk_and_stand"
 
-    def _run_recovery_hold(self) -> None:
-        ratio = min(self.recovery_elapsed / self.recovery_gain_ramp_duration, 1.0)
-        ratio = ratio * ratio * (3.0 - 2.0 * ratio)
-        kp = self.hybrid.kp_real * (self.recovery_kp_fraction * ratio)
-        baseline_kd = np.asarray(
-            [self.leg_damping] * 13 + [self.arm_damping] * 8,
-            dtype=np.float32,
+    def _api_active_policy(self) -> str:
+        if self.state == ControlState.HYBRID:
+            return "hybrid"
+        if self.state in (ControlState.GO_TO_MIMIC_START, ControlState.MIMIC):
+            return self.active_mimic_name or "mimic"
+        return "none"
+
+    def _api_dance_mode(self) -> str:
+        if self.state not in (ControlState.GO_TO_MIMIC_START, ControlState.MIMIC):
+            return "none"
+        if self.active_mimic_name == "victory1":
+            return "dance1"
+        if self.active_mimic_name == "victory2":
+            return "dance2"
+        return "none"
+
+    def _api_control_source(self) -> str:
+        if self.state in (ControlState.GO_TO_MIMIC_START, ControlState.MIMIC):
+            return "policy"
+        if self.state == ControlState.HYBRID:
+            return self.hybrid_control_source
+        return "fsm"
+
+    def _publish_api_status(self) -> None:
+        # The interface document fixes these arrays at 10 elements. Select the
+        # five primary pitch/roll/yaw/knee/ankle-pitch joints from each leg and
+        # omit both ankle-roll joints plus the waist.
+        main_joint_indices = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10)
+        leg_position = self.robot.legState.position
+        leg_velocity = self.robot.legState.velocity
+        com_velocity = list(getattr(self.robot.legState, "est_com_vel", (0.0,) * 3))
+        com_velocity.extend((0.0,) * (3 - len(com_velocity)))
+        measured_velocity = tuple(finite_or_zero(value) for value in com_velocity[:3])
+        gyro = list(getattr(self.robot.legState, "imu_gyro", (0.0,) * 3))
+        gyro.extend((0.0,) * (3 - len(gyro)))
+        measured_stationary = (
+            math.hypot(measured_velocity[0], measured_velocity[1]) < 0.15
+            and abs(measured_velocity[2]) < 0.20
+            and abs(finite_or_zero(gyro[2])) < 0.30
         )
-        kd = baseline_kd + ratio * (self.hybrid.kd_real - baseline_kd)
-        self._send_position(self.recovery_target, kp, kd)
-        self.recovery_elapsed += self.dt
+        upright = self._torso_tilt_deg() <= self.recovery_upright_tilt_deg
+        status = RobotStatus(
+            bus_voltage=finite_or_zero(getattr(self.robot.legState, "bus_voltage", 0.0)),
+            bus_current=finite_or_zero(getattr(self.robot.legState, "bus_current", 0.0)),
+            bus_energy=finite_or_zero(getattr(self.robot.legState, "bus_energy", 0.0)),
+            vel_x=measured_velocity[0],
+            vel_y=measured_velocity[1],
+            vel_z=measured_velocity[2],
+            joint_q=tuple(finite_or_zero(leg_position[index]) for index in main_joint_indices),
+            joint_dq=tuple(finite_or_zero(leg_velocity[index]) for index in main_joint_indices),
+            loco_mode=self._api_loco_mode(),
+            fsm_state=self.state.name.lower(),
+            active_policy=self._api_active_policy(),
+            dance_mode=self._api_dance_mode(),
+            control_source=self._api_control_source(),
+            can_accept_velocity=self.state == ControlState.HYBRID,
+            can_accept_dance=(
+                self.state == ControlState.HYBRID
+                and not self.hybrid.is_moving()
+                and measured_stationary
+                and upright
+            ),
+            transitioning=self.state in (
+                ControlState.GO_TO_DEFAULT,
+                ControlState.GO_TO_MIMIC_START,
+                ControlState.GO_TO_HYBRID_START,
+            ),
+            recovery_active=self.recovery_default_active,
+        )
+        if self.api_server is not None:
+            self.api_server.publish_status(status)
+        now = time.monotonic()
+        if now - self.last_status_log_time >= 1.0:
+            self.last_status_log_time = now
+            self.logger.info(
+                "ROBOT_STATUS fsm_state=%s payload=%s",
+                self.state.name,
+                json.dumps(status.to_dict(), separators=(",", ":")),
+            )
 
     def run(self) -> None:
         print("\n" + "=" * 66)
         print("E1-21DOF Unified Sim2Real FSM (50 Hz)")
         print("  startup : IDLE/read-only; no damping command is sent")
-        print("  [X]     : default pose / assisted recovery")
-        print("  [A]     : STANDBY -> Hybrid; Mimic -> Hybrid")
+        print("  [X]     : damping -> default pose / assisted lifting")
+        print("  [A]     : upright STANDBY -> Hybrid; Mimic -> Hybrid")
         print("  [START] : stationary Hybrid -> victory1 (button 11)")
         print("  [BACK]  : stationary Hybrid -> victory2 (button 10)")
         print("  Mimic1/Mimic2 cannot switch directly; press A first")
         print("  [Y]     : damping")
         print("  [B]     : damping and exit")
+        if self.api_server is not None:
+            print(
+                f"  WebSocket API: ws://{self.api_server.host}:"
+                f"{self.api_server.port}"
+            )
         print("=" * 66 + "\n")
 
         timer = self.NanoSleep(self.dt * 1000.0)
@@ -343,6 +478,12 @@ class UnifiedE1Fsm:
         active_policy = "none"
 
         try:
+            if self.api_server is not None:
+                self.api_server.start()
+                print(
+                    f"[SUCCESS] WebSocket API listening on "
+                    f"{self.api_server.host}:{self.api_server.bound_port}"
+                )
             while True:
                 step_start = time.perf_counter()
                 self.robot.get_robot_state()
@@ -360,9 +501,66 @@ class UnifiedE1Fsm:
                     for name, value in buttons.items()
                 }
                 previous = buttons
+                raw_gamepad_command = self.gamepad.get_commands()
+                gamepad_motion = any(
+                    abs(value) > 1.0e-6 for value in raw_gamepad_command
+                )
+                gamepad_b = self.gamepad.get_button_b()
+                active_buttons = tuple(
+                    name for name, value in {**buttons, "b": gamepad_b}.items()
+                    if value
+                )
+                gamepad_log = (
+                    *(round(float(value), 4) for value in raw_gamepad_command),
+                    active_buttons,
+                )
+                if gamepad_log != self.last_gamepad_log:
+                    self.last_gamepad_log = gamepad_log
+                    self.logger.info(
+                        "GAMEPAD_COMMAND vel_x=%.4f vel_y=%.4f vel_yaw=%.4f "
+                        "buttons=%s",
+                        raw_gamepad_command[0],
+                        raw_gamepad_command[1],
+                        raw_gamepad_command[2],
+                        ",".join(active_buttons) or "none",
+                    )
+                manual_takeover_requested = (
+                    gamepad_motion or any(pressed.values()) or gamepad_b
+                )
 
-                if self.gamepad.get_button_b():
+                api_command = RobotCommand()
+                if self.api_server is not None:
+                    api_command, _ = self.api_server.command_snapshot()
+                    dance_request = self.api_server.pop_dance_request()
+                    if dance_request is not None:
+                        self.pending_api_dance = dance_request
+                api_loco_active = api_command.ctl_mode == "loco"
+
+                # Local controls always have priority. This also revokes a
+                # zero-velocity stand left behind by a disconnected client and
+                # prevents a latched loco_stop from cancelling X recovery on
+                # the following frame.
+                if api_loco_active and manual_takeover_requested:
+                    if self.api_server is not None:
+                        self.api_server.release_control()
+                    api_command = RobotCommand()
+                    api_loco_active = False
+                    self.pending_api_dance = None
+                    self.hybrid_control_source = "gamepad"
+                    print("[INFO] Gamepad input: WebSocket control released")
+                    self.logger.info("CONTROL_OWNER websocket -> gamepad")
+
+                if (
+                    api_loco_active
+                    and api_command.loco_mode == "loco_stop"
+                    and self.state != ControlState.DAMPING
+                ):
+                    self.pending_api_dance = None
+                    self._enter_damping("WebSocket loco_stop requested")
+
+                if gamepad_b:
                     print("\n[EMERGENCY] B pressed: damping and exit")
+                    self.logger.critical("EMERGENCY_STOP source=gamepad_b action=exit")
                     self.control_claimed = True
                     self._send_damping()
                     time.sleep(0.1)
@@ -381,27 +579,19 @@ class UnifiedE1Fsm:
 
                 elif self.state == ControlState.DAMPING:
                     if pressed["x"]:
-                        self._start_recovery_hold()
+                        self.recovery_default_active = True
+                        self.logger.info(
+                            "RECOVERY_DEFAULT_START source=gamepad_x "
+                            "fall_latched=%s",
+                            self.fall_latched,
+                        )
+                        print(
+                            "[SAFETY] X pressed: moving to default pose; "
+                            "lift robot upright before pressing A"
+                        )
+                        self._begin_default_transition()
                     else:
                         self._send_damping()
-
-                elif self.state == ControlState.RECOVERY_HOLD:
-                    if pressed["x"]:
-                        tilt = self._torso_tilt_deg()
-                        if (
-                            self.recovery_elapsed >= self.recovery_gain_ramp_duration
-                            and math.isfinite(tilt)
-                            and tilt <= self.recovery_upright_tilt_deg
-                        ):
-                            print(f"[SAFETY] Upright at {tilt:.1f} deg: going to default pose")
-                            self._begin_default_transition()
-                        else:
-                            print(
-                                f"[SAFETY] X ignored: recovery ramp/tilt not ready "
-                                f"(tilt={tilt:.1f} deg)"
-                            )
-                    if self.state == ControlState.RECOVERY_HOLD:
-                        self._run_recovery_hold()
 
                 elif self.state in (
                     ControlState.GO_TO_DEFAULT,
@@ -429,14 +619,42 @@ class UnifiedE1Fsm:
 
                 elif self.state == ControlState.STANDBY:
                     if pressed["a"]:
-                        self.hybrid.reset(self.robot)
-                        self.target_q = self.hybrid.default_pos_real.copy()
-                        self.state = ControlState.HYBRID
-                        active_policy = "hybrid"
-                        stats_start = time.perf_counter()
-                        loop_steps = 0
-                        policy_steps = 0
-                        print("[SUCCESS] Hybrid walk-run inference started")
+                        ready, tilt = self._hybrid_entry_ready()
+                        if not ready:
+                            print(
+                                "[SAFETY] A ignored: robot is not upright "
+                                f"(tilt={tilt:.1f} deg, required<="
+                                f"{self.recovery_upright_tilt_deg:.1f} deg)"
+                            )
+                            self.logger.warning(
+                                "HYBRID_ENTRY_REJECTED tilt_deg=%.3f threshold_deg=%.3f",
+                                tilt,
+                                self.recovery_upright_tilt_deg,
+                            )
+                            self.target_q = self.hybrid.default_pos_real.copy()
+                            self._send_position(
+                                self.target_q,
+                                self.hybrid.kp_real,
+                                self.hybrid.kd_real,
+                            )
+                        else:
+                            self.recovery_default_active = False
+                            self.fall_latched = False
+                            self.hybrid.reset(self.robot)
+                            self.target_q = self.hybrid.default_pos_real.copy()
+                            self.hybrid_control_source = "gamepad"
+                            self.state = ControlState.HYBRID
+                            active_policy = "hybrid"
+                            stats_start = time.perf_counter()
+                            loop_steps = 0
+                            policy_steps = 0
+                            self.logger.info(
+                                "HYBRID_ENTRY_ACCEPTED tilt_deg=%.3f", tilt
+                            )
+                            print(
+                                "[SUCCESS] Hybrid walk-run inference started "
+                                f"(tilt={tilt:.1f} deg)"
+                            )
                     elif pressed["x"]:
                         self._begin_default_transition()
                     else:
@@ -448,32 +666,76 @@ class UnifiedE1Fsm:
                         )
 
                 elif self.state == ControlState.HYBRID:
-                    raw_command = self.gamepad.get_commands()
-                    self.hybrid.set_gamepad_command(*raw_command)
+                    api_velocity = (
+                        api_command.vel_x,
+                        api_command.vel_y,
+                        api_command.vel_yaw,
+                    )
+                    if api_loco_active:
+                        self.hybrid.set_velocity_command(*api_velocity)
+                        self.hybrid_control_source = "websocket"
+                    else:
+                        self.hybrid.set_gamepad_command(*raw_gamepad_command)
+                        self.hybrid_control_source = "gamepad"
                     if pressed["start"] and pressed["back"]:
                         print("[INFO] START+BACK ignored: select only one Mimic policy")
-                    elif pressed["start"] or pressed["back"]:
+                    elif pressed["start"] or pressed["back"] or self.pending_api_dance:
                         if self.hybrid.is_moving():
                             print(
                                 "[INFO] Mimic request ignored: release the sticks and "
                                 "wait for a zero velocity command before Mimic"
                             )
                         else:
-                            mimic_name = "victory1" if pressed["start"] else "victory2"
-                            button_name = "START" if pressed["start"] else "BACK"
+                            api_dance = self.pending_api_dance
+                            mimic_name = (
+                                "victory1"
+                                if pressed["start"] or api_dance == "dance1"
+                                else "victory2"
+                            )
+                            button_name = (
+                                "START"
+                                if pressed["start"]
+                                else "BACK" if pressed["back"] else "WebSocket"
+                            )
+                            self.pending_api_dance = None
                             print(
                                 f"[INFO] {button_name} pressed in stationary Hybrid: "
                                 f"moving to {mimic_name} start pose"
                             )
                             self._begin_mimic_transition(mimic_name)
+                            self.logger.info(
+                                "DANCE_START name=%s source=%s",
+                                mimic_name,
+                                button_name,
+                            )
+                            if api_dance is not None and self.api_server is not None:
+                                # Dance is an edge-triggered action, not a
+                                # persistent velocity-control lease. Releasing
+                                # here prevents it from replaying after a fall
+                                # recovery and lets the gamepad take over.
+                                self.api_server.release_control()
+                                api_command = RobotCommand()
+                                api_loco_active = False
+                                print(
+                                    "[INFO] WebSocket dance accepted: "
+                                    "control returned to gamepad"
+                                )
+                                self.logger.info(
+                                    "CONTROL_OWNER websocket -> gamepad "
+                                    "reason=dance_started"
+                                )
                     elif pressed["x"]:
                         print("[INFO] Leaving Hybrid: returning to default pose")
                         self.hybrid.command_vel.fill(0.0)
                         self._begin_default_transition()
                     else:
                         try:
-                            self.target_q = self.hybrid.step(
-                                self.robot, raw_command
+                            self.target_q = (
+                                self.hybrid.step_velocity(self.robot, api_velocity)
+                                if api_loco_active
+                                else self.hybrid.step(
+                                    self.robot, raw_gamepad_command
+                                )
                             )
                             policy_steps += 1
                             self._send_position(
@@ -485,10 +747,27 @@ class UnifiedE1Fsm:
                             self._enter_damping(f"Hybrid inference failed: {exc}")
 
                 elif self.state == ControlState.MIMIC:
+                    if api_loco_active or self.pending_api_dance is not None:
+                        rejected = self.pending_api_dance or api_command.dance_mode
+                        print(
+                            "[INFO] Stale WebSocket command dropped during Mimic"
+                        )
+                        self.logger.warning(
+                            "COMMAND_DROPPED state=MIMIC command=%s reason=invalid_state",
+                            rejected,
+                        )
+                        self.pending_api_dance = None
+                        if self.api_server is not None:
+                            self.api_server.release_control()
+                        api_loco_active = False
                     if pressed["a"]:
                         print(
                             f"[INFO] Leaving {self.active_mimic_name}: "
                             "moving to Hybrid default pose"
+                        )
+                        self.logger.info(
+                            "DANCE_EXIT name=%s source=gamepad_a",
+                            self.active_mimic_name,
                         )
                         self._begin_transition(
                             ControlState.GO_TO_HYBRID_START,
@@ -497,12 +776,22 @@ class UnifiedE1Fsm:
                             self.hybrid.kd_real,
                         )
                     elif pressed["x"]:
-                        print("[INFO] Leaving Mimic: returning to default pose")
-                        self._begin_default_transition()
+                        print(
+                            "[INFO] X ignored in Mimic: press A to return to "
+                            "Hybrid before using X"
+                        )
+                        self.logger.warning(
+                            "COMMAND_REJECTED state=MIMIC command=gamepad_x "
+                            "reason=press_A_first"
+                        )
                     elif pressed["start"] or pressed["back"]:
                         print(
                             "[INFO] Direct Mimic switching is disabled: "
                             "press A to return to Hybrid first"
+                        )
+                        self.logger.warning(
+                            "COMMAND_REJECTED state=MIMIC command=gamepad_dance "
+                            "reason=press_A_first"
                         )
                     else:
                         try:
@@ -519,6 +808,7 @@ class UnifiedE1Fsm:
                             self._enter_damping(f"Mimic inference failed: {exc}")
 
                 loop_steps += 1
+                self._publish_api_status()
                 now = time.perf_counter()
                 elapsed = now - stats_start
                 if self.state in (ControlState.HYBRID, ControlState.MIMIC) and elapsed >= 1.0:
@@ -535,7 +825,14 @@ class UnifiedE1Fsm:
 
         except KeyboardInterrupt:
             print("\n[INFO] Ctrl+C detected")
+            self.logger.info("SHUTDOWN reason=keyboard_interrupt")
         finally:
+            if self.api_server is not None:
+                try:
+                    self.api_server.stop()
+                    print("[INFO] WebSocket API stopped")
+                except Exception as exc:
+                    print(f"[WARNING] Failed to stop WebSocket API cleanly: {exc}")
             # Preserve the pre-existing controller if the process is stopped
             # while it is still in read-only IDLE.  Once this FSM has claimed
             # control, always leave the robot in damping on shutdown.
@@ -548,6 +845,11 @@ class UnifiedE1Fsm:
                     print(f"[WARNING] Failed to send final damping command: {exc}")
             else:
                 print("[INFO] Exited from read-only IDLE; motor commands were untouched")
+            self.logger.info(
+                "SHUTDOWN_COMPLETE final_state=%s control_claimed=%s",
+                self.state.name,
+                self.control_claimed,
+            )
             print("Robot process finished")
 
 
@@ -574,6 +876,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mimic2-motion-frames", type=int, default=None)
     parser.add_argument("--mimic1-start-frame", type=int, default=0)
     parser.add_argument("--mimic2-start-frame", type=int, default=0)
+    parser.add_argument("--api-host", default="0.0.0.0")
+    parser.add_argument("--api-port", type=int, default=8765)
+    parser.add_argument("--api-auth-token", default="droidpad")
+    parser.add_argument("--api-status-hz", type=float, default=20.0)
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=CURRENT_DIR / "logs/sim2real_fsm.log",
+        help="Rotating diagnostic log file",
+    )
+    parser.add_argument("--log-max-bytes", type=int, default=10 * 1024 * 1024)
+    parser.add_argument("--log-backup-count", type=int, default=5)
+    parser.add_argument(
+        "--no-api", action="store_true", help="Disable the WebSocket API server"
+    )
     parser.add_argument(
         "--validate-only",
         action="store_true",
@@ -582,8 +899,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_file_logging(
+    path: Path, max_bytes: int, backup_count: int
+) -> Path:
+    if max_bytes <= 0:
+        raise ValueError("--log-max-bytes must be positive")
+    if backup_count < 0:
+        raise ValueError("--log-backup-count cannot be negative")
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = CURRENT_DIR / path
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        path,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)s %(threadName)s "
+            "%(name)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("e1_fsm").info(
+        "LOG_START path=%s max_bytes=%d backup_count=%d",
+        path,
+        max_bytes,
+        backup_count,
+    )
+    return path
+
+
 def main() -> None:
     args = parse_args()
+    log_path = configure_file_logging(
+        args.log_file, args.log_max_bytes, args.log_backup_count
+    )
+    print(f"[INFO] Diagnostic log: {log_path}")
     if args.validate_only:
         hybrid = HybridAmpInference(args.hybrid_policy.resolve())
         mimic1 = MimicInference(
@@ -603,17 +963,27 @@ def main() -> None:
             f"victory1_frames={mimic1.policy.motion_frames}, "
             f"victory2_frames={mimic2.policy.motion_frames}"
         )
+        logging.getLogger("e1_fsm").info("POLICY_VALIDATION success")
         return
-    runner = UnifiedE1Fsm(
-        args.hybrid_policy.resolve(),
-        args.mimic1_policy.resolve(),
-        args.mimic2_policy.resolve(),
-        args.mimic1_motion_frames,
-        args.mimic2_motion_frames,
-        args.mimic1_start_frame,
-        args.mimic2_start_frame,
-    )
-    runner.run()
+    try:
+        runner = UnifiedE1Fsm(
+            args.hybrid_policy.resolve(),
+            args.mimic1_policy.resolve(),
+            args.mimic2_policy.resolve(),
+            args.mimic1_motion_frames,
+            args.mimic2_motion_frames,
+            args.mimic1_start_frame,
+            args.mimic2_start_frame,
+            api_host=args.api_host,
+            api_port=args.api_port,
+            api_auth_token=args.api_auth_token,
+            api_status_hz=args.api_status_hz,
+            api_enabled=not args.no_api,
+        )
+        runner.run()
+    except Exception:
+        logging.getLogger("e1_fsm").exception("FATAL controller terminated")
+        raise
 
 
 if __name__ == "__main__":
