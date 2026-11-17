@@ -85,6 +85,7 @@ class MimicPolicy:
     def __init__(self, policy_path: Path, motion_frames: int | None) -> None:
         if not policy_path.is_file():
             raise FileNotFoundError(f"Mimic ONNX model not found: {policy_path}")
+        self.path = policy_path.resolve()
         print(f"[INFO] Loading Mimic ONNX: {policy_path}")
         self.session = onnxruntime.InferenceSession(
             str(policy_path), providers=["CPUExecutionProvider"]

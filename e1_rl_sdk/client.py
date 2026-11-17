@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
+from collections import deque
+from contextlib import suppress
 import inspect
+import json
+import threading
+import time
 from types import TracebackType
 from typing import Any, Callable, Dict
 
@@ -12,7 +17,7 @@ from websockets.asyncio.client import connect as async_connect
 from websockets.sync.client import ClientConnection as SyncConnection
 from websockets.sync.client import connect as sync_connect
 
-from .models import RobotCommand, RobotStatus
+from .models import CommandResult, RobotCommand, RobotStatus
 
 
 class E1SdkError(RuntimeError):
@@ -32,13 +37,15 @@ def _connect_options(connect_function: Callable[..., Any]) -> Dict[str, Any]:
     return options
 
 
-def _decode_status(message: str | bytes) -> RobotStatus:
+def _decode_message(message: str | bytes) -> CommandResult | RobotStatus:
     if isinstance(message, bytes):
         raise E1SdkError("server returned an unexpected binary message")
     try:
         payload = json.loads(message)
         if not isinstance(payload, dict):
-            raise ValueError("status isn't a JSON object")
+            raise ValueError("response isn't a JSON object")
+        if payload.get("type") == "command_result" or "error" in payload:
+            return CommandResult.from_dict(payload)
         return RobotStatus.from_dict(payload)
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise E1SdkError(f"invalid server response: {exc}") from exc
@@ -54,12 +61,21 @@ class E1RobotClient:
         auth_token: str = "droidpad",
         open_timeout: float = 5.0,
         close_timeout: float = 1.0,
+        heartbeat_interval: float = 0.5,
     ) -> None:
+        if heartbeat_interval <= 0.0:
+            raise ValueError("heartbeat_interval must be positive")
         self.uri = uri
         self.auth_token = auth_token
         self.open_timeout = open_timeout
         self.close_timeout = close_timeout
+        self.heartbeat_interval = float(heartbeat_interval)
         self._connection: SyncConnection | None = None
+        self._send_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._pending_statuses: deque[RobotStatus] = deque(maxlen=100)
+        self.last_command_result: CommandResult | None = None
 
     @property
     def connected(self) -> bool:
@@ -83,38 +99,170 @@ class E1RobotClient:
             connection.close()
             raise
         self._connection = connection
+        self._pending_statuses.clear()
+        self.last_command_result = None
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="e1-sdk-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
         return self
 
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        self._heartbeat_stop.set()
+        heartbeat_thread = self._heartbeat_thread
+        self._heartbeat_thread = None
+        if (
+            heartbeat_thread is not None
+            and heartbeat_thread is not threading.current_thread()
+        ):
+            heartbeat_thread.join(timeout=self.heartbeat_interval + 0.5)
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            with self._send_lock:
+                connection.close()
+        self._pending_statuses.clear()
 
-    def send_command(self, command: RobotCommand) -> None:
+    def _heartbeat_loop(self) -> None:
+        payload = json.dumps({"type": "heartbeat"}, separators=(",", ":"))
+        while not self._heartbeat_stop.wait(self.heartbeat_interval):
+            connection = self._connection
+            if connection is None:
+                return
+            try:
+                with self._send_lock:
+                    connection.send(payload)
+            except Exception:
+                return
+
+    def send_command(
+        self, command: RobotCommand, timeout: float = 2.0
+    ) -> CommandResult:
         connection = self._require_connection()
-        connection.send(
-            json.dumps(command.to_dict(), separators=(",", ":"), ensure_ascii=False)
-        )
+        with self._send_lock:
+            connection.send(
+                json.dumps(
+                    command.to_dict(), separators=(",", ":"), ensure_ascii=False
+                )
+            )
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise E1SdkError("timed out waiting for command acknowledgement")
+            try:
+                response = connection.recv(timeout=remaining)
+            except TimeoutError as exc:
+                raise E1SdkError(
+                    "timed out waiting for command acknowledgement"
+                ) from exc
+            decoded = _decode_message(response)
+            if isinstance(decoded, CommandResult):
+                self.last_command_result = decoded
+                return decoded
+            self._pending_statuses.append(decoded)
 
     def recv_status(self, timeout: float | None = None) -> RobotStatus:
-        return _decode_status(self._require_connection().recv(timeout=timeout))
+        if self._pending_statuses:
+            return self._pending_statuses.popleft()
 
-    def stand(self) -> None:
-        self.send_command(RobotCommand.stand())
+        connection = self._require_connection()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0.0:
+                raise E1SdkError("timed out waiting for robot status")
+            try:
+                response = connection.recv(timeout=remaining)
+            except TimeoutError as exc:
+                raise E1SdkError("timed out waiting for robot status") from exc
+            decoded = _decode_message(response)
+            if isinstance(decoded, RobotStatus):
+                return decoded
+            # Command rejections are data, not malformed status frames.  Keep
+            # the latest result available and continue to the next status.
+            self.last_command_result = decoded
 
-    def walk(self, vel_x: float = 0.0, vel_y: float = 0.0, vel_yaw: float = 0.0) -> None:
-        self.send_command(RobotCommand.walk(vel_x, vel_y, vel_yaw))
+    def stand(
+        self, timeout: float = 2.0, *, transition_timeout: float = 5.0
+    ) -> CommandResult:
+        # Standing is also the SDK-level way to leave a running dance. Mimic
+        # must exit through A; never bypass that deterministic FSM transition.
+        released = self.release(timeout)
+        if not released.success:
+            return released
+        if released.fsm_state == "mimic":
+            switched = self.press_a(timeout)
+            if not switched.success:
+                return switched
+            self._wait_for_hybrid(transition_timeout)
+        return self.send_command(RobotCommand.stand(), timeout)
 
-    def damping(self) -> None:
-        self.send_command(RobotCommand.damping())
+    def walk(
+        self,
+        vel_x: float = 0.0,
+        vel_y: float = 0.0,
+        vel_yaw: float = 0.0,
+        *,
+        timeout: float = 2.0,
+    ) -> CommandResult:
+        return self.send_command(RobotCommand.walk(vel_x, vel_y, vel_yaw), timeout)
 
-    def release(self) -> None:
-        self.send_command(RobotCommand.release())
+    def damping(self, timeout: float = 2.0) -> CommandResult:
+        return self.send_command(RobotCommand.damping(), timeout)
 
-    def dance(self, number: int) -> None:
+    def release(self, timeout: float = 2.0) -> CommandResult:
+        return self.send_command(RobotCommand.release(), timeout)
+
+    def press_a(self, timeout: float = 2.0) -> CommandResult:
+        return self.send_command(RobotCommand.press_a(), timeout)
+
+    def press_x(self, timeout: float = 2.0) -> CommandResult:
+        return self.send_command(RobotCommand.press_x(), timeout)
+
+    def press_y(self, timeout: float = 2.0) -> CommandResult:
+        return self.send_command(RobotCommand.press_y(), timeout)
+
+    def _wait_for_hybrid(
+        self, timeout: float, *, dance_ready: bool = False
+    ) -> RobotStatus:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise E1SdkError(
+                    "timed out waiting for the robot to enter Hybrid"
+                )
+            status = self.recv_status(timeout=remaining)
+            ready = status.can_accept_dance if dance_ready else status.can_accept_velocity
+            if status.fsm_state == "hybrid" and ready:
+                return status
+
+    def dance(
+        self,
+        number: int,
+        timeout: float = 2.0,
+        *,
+        force: bool = False,
+        transition_timeout: float = 5.0,
+    ) -> CommandResult:
+        dance_command = RobotCommand.dance(number)
         # Clear the edge latch before requesting a new dance action.
-        self.release()
-        self.send_command(RobotCommand.dance(number))
+        released = self.release(timeout)
+        if not released.success:
+            return released
+        if force:
+            if released.fsm_state != "hybrid":
+                switched = self.press_a(timeout)
+                if not switched.success:
+                    return switched
+            if released.fsm_state != "hybrid" or not released.can_accept_dance:
+                self._wait_for_hybrid(transition_timeout, dance_ready=True)
+        return self.send_command(dance_command, timeout)
 
     def _require_connection(self) -> SyncConnection:
         if self._connection is None:
@@ -143,12 +291,20 @@ class AsyncE1RobotClient:
         auth_token: str = "droidpad",
         open_timeout: float = 5.0,
         close_timeout: float = 1.0,
+        heartbeat_interval: float = 0.5,
     ) -> None:
+        if heartbeat_interval <= 0.0:
+            raise ValueError("heartbeat_interval must be positive")
         self.uri = uri
         self.auth_token = auth_token
         self.open_timeout = open_timeout
         self.close_timeout = close_timeout
+        self.heartbeat_interval = float(heartbeat_interval)
         self._connection: AsyncConnection | None = None
+        self._send_lock: asyncio.Lock | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._pending_statuses: deque[RobotStatus] = deque(maxlen=100)
+        self.last_command_result: CommandResult | None = None
 
     @property
     def connected(self) -> bool:
@@ -172,38 +328,178 @@ class AsyncE1RobotClient:
             await connection.close()
             raise
         self._connection = connection
+        self._send_lock = asyncio.Lock()
+        self._pending_statuses.clear()
+        self.last_command_result = None
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         return self
 
     async def close(self) -> None:
-        if self._connection is not None:
-            await self._connection.close()
-            self._connection = None
+        heartbeat_task = self._heartbeat_task
+        self._heartbeat_task = None
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            send_lock = self._send_lock
+            if send_lock is None:
+                await connection.close()
+            else:
+                async with send_lock:
+                    await connection.close()
+        self._send_lock = None
+        self._pending_statuses.clear()
 
-    async def send_command(self, command: RobotCommand) -> None:
-        await self._require_connection().send(
-            json.dumps(command.to_dict(), separators=(",", ":"), ensure_ascii=False)
+    async def _heartbeat_loop(self) -> None:
+        payload = json.dumps({"type": "heartbeat"}, separators=(",", ":"))
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            connection = self._connection
+            send_lock = self._send_lock
+            if connection is None or send_lock is None:
+                return
+            try:
+                async with send_lock:
+                    await connection.send(payload)
+            except Exception:
+                return
+
+    async def _receive_message(
+        self, timeout: float | None
+    ) -> CommandResult | RobotStatus:
+        receive = self._require_connection().recv()
+        raw = await receive if timeout is None else await asyncio.wait_for(
+            receive, timeout
         )
+        return _decode_message(raw)
 
-    async def recv_status(self) -> RobotStatus:
-        return _decode_status(await self._require_connection().recv())
+    async def send_command(
+        self, command: RobotCommand, timeout: float = 2.0
+    ) -> CommandResult:
+        connection = self._require_connection()
+        send_lock = self._send_lock
+        if send_lock is None:
+            raise E1SdkError("client heartbeat isn't initialized")
+        async with send_lock:
+            await connection.send(
+                json.dumps(
+                    command.to_dict(), separators=(",", ":"), ensure_ascii=False
+                )
+            )
 
-    async def stand(self) -> None:
-        await self.send_command(RobotCommand.stand())
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise E1SdkError("timed out waiting for command acknowledgement")
+            try:
+                decoded = await self._receive_message(remaining)
+            except asyncio.TimeoutError as exc:
+                raise E1SdkError(
+                    "timed out waiting for command acknowledgement"
+                ) from exc
+            if isinstance(decoded, CommandResult):
+                self.last_command_result = decoded
+                return decoded
+            self._pending_statuses.append(decoded)
+
+    async def recv_status(self, timeout: float | None = None) -> RobotStatus:
+        if self._pending_statuses:
+            return self._pending_statuses.popleft()
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0.0:
+                raise E1SdkError("timed out waiting for robot status")
+            try:
+                decoded = await self._receive_message(remaining)
+            except asyncio.TimeoutError as exc:
+                raise E1SdkError("timed out waiting for robot status") from exc
+            if isinstance(decoded, RobotStatus):
+                return decoded
+            self.last_command_result = decoded
+
+    async def stand(
+        self, timeout: float = 2.0, *, transition_timeout: float = 5.0
+    ) -> CommandResult:
+        released = await self.release(timeout)
+        if not released.success:
+            return released
+        if released.fsm_state == "mimic":
+            switched = await self.press_a(timeout)
+            if not switched.success:
+                return switched
+            await self._wait_for_hybrid(transition_timeout)
+        return await self.send_command(RobotCommand.stand(), timeout)
 
     async def walk(
-        self, vel_x: float = 0.0, vel_y: float = 0.0, vel_yaw: float = 0.0
-    ) -> None:
-        await self.send_command(RobotCommand.walk(vel_x, vel_y, vel_yaw))
+        self,
+        vel_x: float = 0.0,
+        vel_y: float = 0.0,
+        vel_yaw: float = 0.0,
+        *,
+        timeout: float = 2.0,
+    ) -> CommandResult:
+        return await self.send_command(
+            RobotCommand.walk(vel_x, vel_y, vel_yaw), timeout
+        )
 
-    async def damping(self) -> None:
-        await self.send_command(RobotCommand.damping())
+    async def damping(self, timeout: float = 2.0) -> CommandResult:
+        return await self.send_command(RobotCommand.damping(), timeout)
 
-    async def release(self) -> None:
-        await self.send_command(RobotCommand.release())
+    async def release(self, timeout: float = 2.0) -> CommandResult:
+        return await self.send_command(RobotCommand.release(), timeout)
 
-    async def dance(self, number: int) -> None:
-        await self.release()
-        await self.send_command(RobotCommand.dance(number))
+    async def press_a(self, timeout: float = 2.0) -> CommandResult:
+        return await self.send_command(RobotCommand.press_a(), timeout)
+
+    async def press_x(self, timeout: float = 2.0) -> CommandResult:
+        return await self.send_command(RobotCommand.press_x(), timeout)
+
+    async def press_y(self, timeout: float = 2.0) -> CommandResult:
+        return await self.send_command(RobotCommand.press_y(), timeout)
+
+    async def _wait_for_hybrid(
+        self, timeout: float, *, dance_ready: bool = False
+    ) -> RobotStatus:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise E1SdkError(
+                    "timed out waiting for the robot to enter Hybrid"
+                )
+            status = await self.recv_status(timeout=remaining)
+            ready = status.can_accept_dance if dance_ready else status.can_accept_velocity
+            if status.fsm_state == "hybrid" and ready:
+                return status
+
+    async def dance(
+        self,
+        number: int,
+        timeout: float = 2.0,
+        *,
+        force: bool = False,
+        transition_timeout: float = 5.0,
+    ) -> CommandResult:
+        dance_command = RobotCommand.dance(number)
+        released = await self.release(timeout)
+        if not released.success:
+            return released
+        if force:
+            if released.fsm_state != "hybrid":
+                switched = await self.press_a(timeout)
+                if not switched.success:
+                    return switched
+            if released.fsm_state != "hybrid" or not released.can_accept_dance:
+                await self._wait_for_hybrid(
+                    transition_timeout, dance_ready=True
+                )
+        return await self.send_command(dance_command, timeout)
 
     def _require_connection(self) -> AsyncConnection:
         if self._connection is None:

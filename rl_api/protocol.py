@@ -14,6 +14,7 @@ CTL_MODES = frozenset(("none", "loco"))
 COMMAND_LOCO_MODES = frozenset(("loco_stop", "loco_walk_and_stand"))
 STATUS_LOCO_MODES = frozenset(("none", "loco_stop", "loco_walk_and_stand", "loco_fall"))
 DANCE_MODES = frozenset(("none", "dance1", "dance2"))
+FSM_ACTIONS = frozenset(("none", "a", "x", "y"))
 
 
 class ProtocolError(ValueError):
@@ -52,9 +53,9 @@ def finite_or_zero(value: Any) -> float:
 class RobotCommand:
     """Validated ``robot_cmd`` request.
 
-    ``dance_mode`` is a backwards-compatible extension because the supplied
-    document says dances are WebSocket-triggerable but doesn't assign a field.
-    Omitting it is identical to sending ``"none"``.
+    ``dance_mode`` and ``fsm_action`` are backwards-compatible extensions for
+    actions that the supplied document doesn't assign fields to. Omitting
+    either is identical to sending ``"none"``.
     """
 
     ctl_mode: str = "none"
@@ -68,6 +69,7 @@ class RobotCommand:
     loco_mode: str = "loco_walk_and_stand"
     arm_mode: str = "none"
     dance_mode: str = "none"
+    fsm_action: str = "none"
 
     @classmethod
     def from_payload(cls, payload: Any) -> "RobotCommand":
@@ -92,6 +94,9 @@ class RobotCommand:
         dance_mode = _string_choice(
             payload.get("dance_mode", "none"), "dance_mode", DANCE_MODES
         )
+        fsm_action = _string_choice(
+            payload.get("fsm_action", "none"), "fsm_action", FSM_ACTIONS
+        )
         velocities = {
             name: _finite_float(payload.get(name, 0.0), name)
             for name in ("vel_x", "vel_y", "vel_yaw")
@@ -104,6 +109,13 @@ class RobotCommand:
                 )
             if any(abs(value) > 1.0e-9 for value in velocities.values()):
                 raise ProtocolError("dance_mode requires zero velocity")
+        if fsm_action != "none":
+            if ctl_mode != "none":
+                raise ProtocolError("fsm_action requires ctl_mode=none")
+            if dance_mode != "none":
+                raise ProtocolError("fsm_action cannot be combined with dance_mode")
+            if any(abs(value) > 1.0e-9 for value in velocities.values()):
+                raise ProtocolError("fsm_action requires zero velocity")
 
         return cls(
             ctl_mode=ctl_mode,
@@ -115,12 +127,15 @@ class RobotCommand:
             loco_mode=loco_mode,
             arm_mode="none",
             dance_mode=dance_mode,
+            fsm_action=fsm_action,
         )
 
     def to_dict(self, *, include_extensions: bool = True) -> dict[str, Any]:
         result = asdict(self)
         if not include_extensions and self.dance_mode == "none":
             result.pop("dance_mode")
+        if not include_extensions and self.fsm_action == "none":
+            result.pop("fsm_action")
         return result
 
     @classmethod
@@ -149,6 +164,9 @@ class RobotStatus:
     control_source: str = "gamepad"
     can_accept_velocity: bool = False
     can_accept_dance: bool = False
+    can_accept_a: bool = False
+    can_accept_x: bool = False
+    can_accept_y: bool = True
     transitioning: bool = False
     recovery_active: bool = False
 
@@ -205,6 +223,9 @@ class RobotStatus:
             control_source=str(payload.get("control_source", "gamepad")),
             can_accept_velocity=bool(payload.get("can_accept_velocity", False)),
             can_accept_dance=bool(payload.get("can_accept_dance", False)),
+            can_accept_a=bool(payload.get("can_accept_a", False)),
+            can_accept_x=bool(payload.get("can_accept_x", False)),
+            can_accept_y=bool(payload.get("can_accept_y", True)),
             transitioning=bool(payload.get("transitioning", False)),
             recovery_active=bool(payload.get("recovery_active", False)),
         )

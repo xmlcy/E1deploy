@@ -5,15 +5,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import suppress
 import json
 import time
 
 from websockets.asyncio.client import connect
 
 
+async def send_heartbeats(websocket) -> None:
+    while True:
+        await asyncio.sleep(0.5)
+        await websocket.send(json.dumps({"type": "heartbeat"}))
+
+
 def command_for(args: argparse.Namespace) -> dict[str, object]:
+    state_action = args.action in ("a", "x", "y")
     command: dict[str, object] = {
-        "ctl_mode": "loco" if args.action != "status" else "none",
+        "ctl_mode": "none" if args.action == "status" or state_action else "loco",
         "vel_x": 0.0,
         "vel_y": 0.0,
         "vel_yaw": 0.0,
@@ -30,6 +38,8 @@ def command_for(args: argparse.Namespace) -> dict[str, object]:
         command["loco_mode"] = "loco_stop"
     elif args.action in ("dance1", "dance2"):
         command["dance_mode"] = args.action
+    elif state_action:
+        command["fsm_action"] = args.action
     return command
 
 
@@ -40,6 +50,7 @@ async def run(args: argparse.Namespace) -> None:
         if json.loads(auth_response) != "droidup":
             raise RuntimeError(f"authentication failed: {auth_response!r}")
         print(f"authenticated: {auth_response}")
+        heartbeat_task = asyncio.create_task(send_heartbeats(websocket))
 
         command = command_for(args)
         print("send:", json.dumps(command, ensure_ascii=False))
@@ -48,13 +59,23 @@ async def run(args: argparse.Namespace) -> None:
         deadline = time.monotonic() + args.duration
         while time.monotonic() < deadline:
             response = json.loads(await asyncio.wait_for(websocket.recv(), 2.0))
-            label = "command failed" if "error" in response else "status"
+            if response.get("type") == "command_result":
+                label = (
+                    "command accepted"
+                    if response.get("success")
+                    else "command rejected"
+                )
+            else:
+                label = "status"
             print(f"{label}:", json.dumps(response, ensure_ascii=False))
 
         if args.action == "walk":
             command.update(vel_x=0.0, vel_y=0.0, vel_yaw=0.0)
             await websocket.send(json.dumps(command))
             print("sent zero-velocity stand before disconnect")
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-token", default="droidpad")
     parser.add_argument(
         "--action",
-        choices=("status", "stand", "walk", "stop", "dance1", "dance2"),
+        choices=("status", "stand", "walk", "stop", "a", "x", "y", "dance1", "dance2"),
         default="status",
     )
     parser.add_argument("--vel-x", type=float, default=0.2)

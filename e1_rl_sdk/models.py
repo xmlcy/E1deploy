@@ -29,6 +29,7 @@ class RobotCommand:
     loco_mode: str = "loco_walk_and_stand"
     arm_mode: str = "none"
     dance_mode: str = "none"
+    fsm_action: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,6 +62,75 @@ class RobotCommand:
             raise ValueError("dance number must be 1 or 2")
         return cls(dance_mode=f"dance{number}")
 
+    @classmethod
+    def press_a(cls) -> "RobotCommand":
+        return cls(ctl_mode="none", fsm_action="a")
+
+    @classmethod
+    def press_x(cls) -> "RobotCommand":
+        return cls(ctl_mode="none", fsm_action="x")
+
+    @classmethod
+    def press_y(cls) -> "RobotCommand":
+        return cls(ctl_mode="none", fsm_action="y")
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Server acknowledgement for one command.
+
+    ``success`` means that the command passed the server-side state checks and
+    was accepted by the controller.  A rejected command is a normal API result,
+    not an SDK/protocol exception.
+    """
+
+    success: bool
+    code: str
+    message: str
+    fsm_state: str = "unknown"
+    active_policy: str = "none"
+    dance_mode: str = "none"
+    can_accept_velocity: bool = False
+    can_accept_dance: bool = False
+    can_accept_a: bool = False
+    can_accept_x: bool = False
+    can_accept_y: bool = True
+    recovery_active: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "CommandResult":
+        # Accept the original error envelope as well so a new SDK can still
+        # report a rejection cleanly when connected to an older server.
+        if "error" in payload:
+            error = payload["error"]
+            if isinstance(error, Mapping):
+                source = error
+            else:
+                source = {"code": "command_rejected", "message": str(error)}
+            success = False
+        else:
+            source = payload
+            success = bool(source.get("success", False))
+
+        return cls(
+            success=success,
+            code=str(source.get("code", "ok" if success else "command_rejected")),
+            message=str(
+                source.get(
+                    "message", "command accepted" if success else "command rejected"
+                )
+            ),
+            fsm_state=str(source.get("fsm_state", "unknown")),
+            active_policy=str(source.get("active_policy", "none")),
+            dance_mode=str(source.get("dance_mode", "none")),
+            can_accept_velocity=bool(source.get("can_accept_velocity", False)),
+            can_accept_dance=bool(source.get("can_accept_dance", False)),
+            can_accept_a=bool(source.get("can_accept_a", False)),
+            can_accept_x=bool(source.get("can_accept_x", False)),
+            can_accept_y=bool(source.get("can_accept_y", True)),
+            recovery_active=bool(source.get("recovery_active", False)),
+        )
+
 
 @dataclass(frozen=True)
 class RobotStatus:
@@ -81,6 +151,9 @@ class RobotStatus:
     control_source: str = "gamepad"
     can_accept_velocity: bool = False
     can_accept_dance: bool = False
+    can_accept_a: bool = False
+    can_accept_x: bool = False
+    can_accept_y: bool = True
     transitioning: bool = False
     recovery_active: bool = False
 
@@ -126,6 +199,9 @@ class RobotStatus:
             control_source=str(payload.get("control_source", "gamepad")),
             can_accept_velocity=bool(payload.get("can_accept_velocity", False)),
             can_accept_dance=bool(payload.get("can_accept_dance", False)),
+            can_accept_a=bool(payload.get("can_accept_a", False)),
+            can_accept_x=bool(payload.get("can_accept_x", False)),
+            can_accept_y=bool(payload.get("can_accept_y", True)),
             transitioning=bool(payload.get("transitioning", False)),
             recovery_active=bool(payload.get("recovery_active", False)),
         )

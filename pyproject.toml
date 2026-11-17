@@ -6,8 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "e1-rl-sdk"
 version = "0.1.0"
 description = "WebSocket API and Python SDK for the E1 RL controller"
+readme = "e1_rl_sdk/README.md"
 requires-python = ">=3.8"
 dependencies = ["websockets>=13,<17"]
 
 [tool.setuptools]
 packages = ["e1_rl_sdk", "rl_api"]
+
+[tool.setuptools.package-data]
+e1_rl_sdk = ["README.md"]
