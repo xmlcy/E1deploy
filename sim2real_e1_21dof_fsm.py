@@ -982,7 +982,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=CURRENT_DIR / "logs/sim2real_fsm.log",
+        default=(
+            Path(sys.executable).resolve().parent / "logs/sim2real_fsm.log"
+            if getattr(sys, "frozen", False)
+            else CURRENT_DIR / "logs/sim2real_fsm.log"
+        ),
         help="Rotating diagnostic log file",
     )
     parser.add_argument("--log-max-bytes", type=int, default=10 * 1024 * 1024)

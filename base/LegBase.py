@@ -3,7 +3,6 @@ import time
 import csv
 import numpy as np
 from grpc import insecure_channel
-from torch.nn.init import zeros_
 
 from base.Base import *
 from base.configs import E1_21dof as Config

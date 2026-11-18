@@ -5,8 +5,8 @@ import numpy as np
 
 class _BaseConfig:
     """Shared defaults."""
-    grpc_channel = "localhost"
-    # grpc_channel = '192.168.254.100'
+    # grpc_channel = "localhost"
+    grpc_channel = '192.168.254.100'
 
     @classmethod
     def _zeros(cls, n):
